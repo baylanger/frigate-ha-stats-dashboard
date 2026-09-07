@@ -3,7 +3,7 @@
 This sets up two Home Assistant bar-graph dashboards backed by Frigate's
 event history:
 
-1. **Hourly detections** — person/car counts per hour, last 12h
+1. **Hourly detections** — bus/car/motorcycle/person counts per hour, last 12h
 2. **Passerby probability** — likelihood of a detection per 5-min bucket,
    split weekday vs. weekend, based on the last 3 weeks
 
