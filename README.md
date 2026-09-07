@@ -1,4 +1,4 @@
-# Frigate Detection Dashboard — Install Guide
+# Frigate Detection Stats Home Assistant Dashboard — Install Guide
 
 This sets up two Home Assistant bar-graph dashboards backed by Frigate's
 event history:
