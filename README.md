@@ -84,35 +84,60 @@ nothing below will work without it.
    - Set `FRIGATE_URL` to your actual Frigate host/port.
    - `HOURLY_CRON` / `PROBABILITY_CRON` control how often each graph
      type refreshes, in standard 5-field cron syntax. Defaults:
-     every 15 minutes for the hourly-style graphs, nightly at 03:00
-     for the probability graph. Edit these directly rather than the
-     `@time_trigger(...)` decorators further down the file.
+     every 5 minutes for the hourly-style graphs, hourly for the
+     probability graph.
+   - The probability graph uses an **incremental** design, not a full
+     rescan every run: it keeps a persisted per-day/per-bucket "hit
+     set" (`pyscript.frigate_probability_daily_cache`) recording which
+     5-min buckets had a detection, per day, per label. Each run only
+     fetches events *since the last run* (cheap), folds them into
+     today's entry, drops any day older than `days_back` from the
+     cache, and recomputes weekday/weekend probabilities from the
+     retained per-day data — no Frigate query needed for that last
+     step. This is what makes hourly (or even more frequent)
+     `PROBABILITY_CRON` reasonable despite `days_back: 21` — the
+     21-day window is only fully rescanned once, to seed the cache,
+     or again later if the cache goes stale (e.g. HA was down longer
+     than `days_back`). The hourly graph doesn't need this — it only
+     scans its `hours_back` window (12h by default) every run, which
+     is already cheap regardless of `HOURLY_CRON`'s frequency. Edit
+     the cron constants directly rather than the `@time_trigger(...)`
+     decorators further down the file.
    - The script survives HA restarts without re-querying Frigate,
      via a cache-and-restore pattern: `state.persist()` only works on
      entities in the `pyscript.*` domain (it rejects `sensor.*`
-     directly), so each real sensor's value is mirrored into a
-     matching `pyscript.frigate_hourly_cache` / `pyscript.
-     frigate_probability_cache` entity, that cache entity is what
-     gets persisted, and a `startup`-triggered function copies the
-     restored cache back onto the real sensor. This restores
-     *last-known* data instantly, not a fresh pull — the sensors
-     self-correct at the next scheduled/manual refresh. On the very
-     first run ever (before the cache has anything in it), the
-     startup function computes fresh instead of leaving the sensor
-     empty — this only happens once, since after that the cache is
-     always populated. Note this cache setup only supports one entry
-     per mode (`hourly` / `probability`) — see the comment above
-     `GRAPH_CONFIGS` if you add more.
-     add more.
+     directly), so each real sensor's *final computed output* is
+     mirrored into a matching `pyscript.frigate_hourly_cache` /
+     `pyscript.frigate_probability_cache` "display cache" entity,
+     that entity is what gets persisted, and a `startup`-triggered
+     function copies the restored cache back onto the real sensor.
+     This restores *last-known* data instantly, not a fresh pull —
+     the sensors self-correct at the next scheduled/manual refresh.
+     On the very first run ever (before the cache has anything in
+     it), the startup function computes fresh instead of leaving the
+     sensor empty — this only happens once, since after that the
+     cache is always populated. Note this display-cache setup only
+     supports one entry per mode (`hourly` / `probability`) — see the
+     comment above `GRAPH_CONFIGS` if you add more.
+   - Separately, the probability graph also persists a second,
+     different-purpose cache — `pyscript.frigate_probability_daily_cache`
+     — holding the raw per-day hit data described above. This one
+     *is* keyed per-sensor internally, so it does support multiple
+     probability entries without collision, unlike the display cache.
+     Don't confuse the two: the display cache is about surviving
+     restarts without a blank dashboard; the daily cache is about
+     avoiding a full 21-day rescan on every refresh.
    - Review `GRAPH_CONFIGS` — the two default entries (`hourly` and
      `probability`) match the sensors used by the dashboard cards below.
      Adjust `zones`, `required_zones`, `labels`, `sub_labels`, and
      `min_score` per entry as needed.
    - Both graph modes support `bucket_min` — the bar width in minutes.
-     `hourly` mode defaults to `60` (one bar per hour) if omitted; set
-     it lower (e.g. `15`) for finer bars over the `hours_back` window.
-     `probability` mode has no default — it's required for that mode
-     (the earlier examples use `5`).
+     `hourly` mode defaults to `60` (one bar per hour) if omitted; the
+     default `GRAPH_CONFIGS` entry sets it to `5` to match
+     `HOURLY_CRON`'s refresh cadence — these two don't have to match,
+     but it's a sensible default so bars update as often as they can
+     meaningfully change. `probability` mode has no default — it's
+     required for that mode (the earlier examples use `5`).
 4. Reload pyscript: Developer Tools → YAML → **pyscript** (or restart HA).
 
 ### Verify it's running
@@ -129,9 +154,14 @@ nothing below will work without it.
   calling them directly in YAML mode rather than relying on the
   dropdown (which can be stale), or check the pyscript logs for a
   loading error.
-- `passerby_probability` runs nightly at 03:00 by default — trigger it
-  manually the first time so you don't wait a day to see data:
+- `passerby_probability` runs hourly by default — trigger it
+  manually the first time so you don't wait up to an hour to see data:
   Developer Tools → Actions → run `pyscript.frigate_refresh_probability`.
+  There's also `pyscript.frigate_reset_probability_cache` — run this
+  (then re-run the refresh) any time you change a probability entry's
+  `zones`/`min_score`/`labels`/`required_zones`, so the incremental
+  cache reseeds under the new filter instead of mixing old and new
+  criteria together.
 - Click either sensor and check its **attributes** — you should see
   `hours`/`timestamps`/`person`/`car` arrays (hourly sensor) or
   `labels`/`timestamps`/`person_weekday`/`person_weekend` arrays
@@ -230,8 +260,8 @@ weekday/weekend buckets aren't overlapping in one chart.
 
 **Note:** these cards compute today's date **in the browser** (via
 `new Date()`) rather than relying on the sensor's stored `timestamps`
-attribute. The sensor only refreshes nightly at 03:00
-(`PROBABILITY_CRON`), so a timestamp anchored to "today" at the time
+attribute. The sensor only refreshes on `PROBABILITY_CRON`'s schedule
+(hourly by default), so a timestamp anchored to "today" at the time
 of that run goes stale the moment the calendar rolls over — the card
 would then be asking for "today" while the data is still labeled
 "yesterday," and every bar gets filtered out with no error. Computing
@@ -342,3 +372,4 @@ ApexCharts card pointing at the new sensor's attributes.
 | `NameError: invalid name sensor.x (should be 'pyscript.entity')` | `state.persist()` only works on `pyscript.*` domain entities — it can't persist `sensor.*` (or any other domain) directly, full stop. The current script works around this by mirroring each sensor into a `pyscript.*` cache entity and restoring from that cache on `startup` — if you hit this error, you're on an older copy that tried to persist the sensor entities directly |
 | Weekend probability graph only ever shows 0% or 100%, weekday looks smoother | This is expected with a small sample — probability is `hit_days / n_days_sampled`. If `person_weekend_days_sampled` is currently `1` (check the sensor attribute in Developer Tools → States), every bucket can only be 0/1 or 1/1 — no in-between value is mathematically possible yet. Since Frigate retention was only recently extended, historical weekend days cant be backfilled; they accumulate one real calendar day at a time. Weekdays smooth out first simply because there are 5 of them per week vs. 2 weekend days. This self-corrects as more weekends pass within the 21-day window — no fix needed, just time |
 | Card was working, now stuck "loading..." after renaming a label in `GRAPH_CONFIGS` | Attribute keys on the sensor come directly from whatever strings are in that entry's `labels` list — renaming a label (e.g. `motorbike` → `motorcycle`) changes the attribute name too. Any card `data_generator` still referencing the old name gets `undefined`, which throws and hangs the card. Update every card that references that label whenever you rename one in `GRAPH_CONFIGS` |
+| Probability numbers look wrong/frozen after editing `zones`, `min_score`, `labels`, or `required_zones` in a probability entry | The incremental cache doesn't know a filter changed — it just keeps folding new events into whatever was already cached under the old filter, silently mixing old and new criteria. Run `pyscript.frigate_reset_probability_cache` (Developer Tools → Actions) after changing any filter on a `probability`-mode entry, then trigger `pyscript.frigate_refresh_probability` to force a full reseed |

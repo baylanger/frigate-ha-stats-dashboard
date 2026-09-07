@@ -1,13 +1,12 @@
 import requests
 from datetime import datetime, timedelta
 
-# Edit for you configuration
 FRIGATE_URL = "http://<frigate-host>:5000"
 
 # --- Refresh schedules ---------------------------------------------------
 # Standard 5-field cron syntax: minute hour day month day_of_week
-HOURLY_CRON = "*/15 * * * *"       # how often the hourly/short-window graphs refresh
-PROBABILITY_CRON = "0 3 * * *"     # how often the weekday/weekend probability graph refreshes
+HOURLY_CRON = "*/5 * * * *"        # how often the hourly/short-window graphs refresh
+PROBABILITY_CRON = "0 * * * *"     # how often the weekday/weekend probability graph refreshes (hourly — still a 21-day query each run, so more frequent than this gets expensive fast)
 
 # --- Survive HA restarts without re-querying Frigate immediately -------
 # state.persist() ONLY works on entities in the pyscript.* domain — it
@@ -20,6 +19,11 @@ PROBABILITY_CRON = "0 3 * * *"     # how often the weekday/weekend probability g
 # hitting Frigate at all.
 state.persist("pyscript.frigate_hourly_cache", default_value=0)
 state.persist("pyscript.frigate_probability_cache", default_value="unknown")
+# Separate from the display cache above: this one holds the raw
+# per-day/per-bucket hit data that compute_probability() needs to do
+# incremental (delta-fetch) updates instead of a full 21-day rescan
+# every run. See compute_probability() for details.
+state.persist("pyscript.frigate_probability_daily_cache", default_value="ok")
 
 # --- Graph definitions -------------------------------------------------
 # zones:          OR filter — event counts if it touched ANY of these. [] = any zone (no filter).
@@ -39,8 +43,8 @@ GRAPH_CONFIGS = [
         "sensor": "sensor.frigate_hourly_detections",
         "mode": "hourly",
         "hours_back": 12,
-        "bucket_min": 15,   # bar width in minutes; omit for hourly (default 60)
-        "labels": ["bicycle", "car", "motorcycle", "person"],
+        "bucket_min": 5,    # bar width in minutes; omit for hourly (default 60)
+        "labels": ["bicycle", "bus", "car", "motorcycle", "person"],
         "zones": [],
         "required_zones": [],
         "sub_labels": [],
@@ -143,10 +147,31 @@ def compute_hourly(cfg):
     state.set("pyscript.frigate_hourly_cache", total, new_attributes=attrs)
 
 # --- Probability bar graph --------------------------------------------
+#
+# Incremental design: instead of re-fetching and recomputing the full
+# 21-day window every run, this keeps a persisted per-day/per-bucket
+# "hit set" (which 5-min buckets had at least one detection, per day,
+# per label) in pyscript.frigate_probability_daily_cache. Each run:
+#   1. Fetch only events since the last processed timestamp (cheap).
+#   2. Fold new hits into today's entry in the per-day cache.
+#   3. Drop any day older than days_back from the cache (rolling window).
+#   4. Recompute weekday/weekend probabilities from the *retained*
+#      per-day cache — pure local math, no Frigate query involved.
+#   5. Persist the updated per-day cache + a "last processed" watermark.
+# If there's no cache yet, or the watermark is older than the days_back
+# window (e.g. after extended downtime), it falls back to a full
+# rescan of the window to reseed itself — this should only happen once
+# under normal operation.
+#
+# NOTE: keyed by cfg["sensor"], so multiple probability entries in
+# GRAPH_CONFIGS (if you ever add more) don't collide with each other,
+# even though — like the display cache — this is one shared cache
+# entity across all of them.
+
+DAILY_CACHE_ENTITY = "pyscript.frigate_probability_daily_cache"
 
 def compute_probability(cfg):
     now = datetime.now()
-    start = now - timedelta(days=cfg["days_back"])
     n_buckets = (24 * 60) // cfg["bucket_min"]
     labels_axis = [f"{(b*cfg['bucket_min'])//60:02d}:{(b*cfg['bucket_min'])%60:02d}"
                    for b in range(n_buckets)]
@@ -159,35 +184,66 @@ def compute_probability(cfg):
 
     attrs = {"labels": labels_axis, "timestamps": timestamps}
 
+    sensor_key = cfg["sensor"]
+    window_start_ts = (now - timedelta(days=cfg["days_back"])).timestamp()
+    cutoff_date = (now - timedelta(days=cfg["days_back"])).date()
+
+    cache_attrs = state.getattr(DAILY_CACHE_ENTITY) or {}
+    all_daily_hits = cache_attrs.get("daily_hits", {})
+    all_last_ts = cache_attrs.get("last_processed_ts", {})
+
+    sensor_daily_hits = all_daily_hits.get(sensor_key, {})   # {label: {date_str: [bucket, ...]}}
+    last_ts = all_last_ts.get(sensor_key)
+
+    # Reseed with a full rescan if there's no watermark yet, or it's
+    # older than the window itself (e.g. long HA downtime) — otherwise
+    # a delta fetch from the watermark is all that's needed.
+    if last_ts is None or last_ts < window_start_ts:
+        fetch_start_ts = window_start_ts
+        sensor_daily_hits = {}
+    else:
+        fetch_start_ts = last_ts
+
     for label in cfg["labels"]:
+        label_hits = {d: set(b) for d, b in sensor_daily_hits.get(label, {}).items()}
+
         events = fetch_events(
-            start.timestamp(), label,
+            fetch_start_ts, label,
             zones=cfg["zones"], required_zones=cfg["required_zones"],
             sub_labels=cfg["sub_labels"], min_score=cfg["min_score"],
         )
-
-        weekday_hits, weekend_hits = {}, {}
-        weekday_dates, weekend_dates = set(), set()
-
         for ev in events:
             ts = datetime.fromtimestamp(ev["start_time"])
             date_str = ts.strftime("%Y-%m-%d")
             bucket = (ts.hour * 60 + ts.minute) // cfg["bucket_min"]
-            is_weekend = ts.weekday() >= 5
+            label_hits.setdefault(date_str, set()).add(bucket)
 
-            hits = weekend_hits if is_weekend else weekday_hits
-            hits.setdefault(date_str, set()).add(bucket)
-            (weekend_dates if is_weekend else weekday_dates).add(date_str)
+        # Expire days that have aged out of the rolling window.
+        label_hits = {d: b for d, b in label_hits.items()
+                      if datetime.strptime(d, "%Y-%m-%d").date() >= cutoff_date}
 
-        def probs(hits, dates):
+        weekday_dates = [d for d in label_hits if datetime.strptime(d, "%Y-%m-%d").weekday() < 5]
+        weekend_dates = [d for d in label_hits if datetime.strptime(d, "%Y-%m-%d").weekday() >= 5]
+
+        def probs(dates):
             n_days = max(len(dates), 1)
-            return [round(sum([1 for d in hits if b in hits[d]]) / n_days, 3)
+            return [round(sum([1 for d in dates if b in label_hits[d]]) / n_days, 3)
                     for b in range(n_buckets)]
 
-        attrs[f"{label}_weekday"] = probs(weekday_hits, weekday_dates)
-        attrs[f"{label}_weekend"] = probs(weekend_hits, weekend_dates)
+        attrs[f"{label}_weekday"] = probs(weekday_dates)
+        attrs[f"{label}_weekend"] = probs(weekend_dates)
         attrs[f"{label}_weekday_days_sampled"] = len(weekday_dates)
         attrs[f"{label}_weekend_days_sampled"] = len(weekend_dates)
+
+        # Store back as sorted lists — sets aren't JSON-safe for state storage.
+        sensor_daily_hits[label] = {d: sorted(b) for d, b in label_hits.items()}
+
+    all_daily_hits[sensor_key] = sensor_daily_hits
+    all_last_ts[sensor_key] = now.timestamp()
+    state.set(DAILY_CACHE_ENTITY, "ok", new_attributes={
+        "daily_hits": all_daily_hits,
+        "last_processed_ts": all_last_ts,
+    })
 
     state.set(cfg["sensor"], "ok", new_attributes=attrs)
     state.set("pyscript.frigate_probability_cache", "ok", new_attributes=attrs)
@@ -243,3 +299,13 @@ def frigate_refresh_probability():
     for cfg in GRAPH_CONFIGS:
         if cfg["mode"] == "probability":
             compute_probability(cfg)
+
+@service
+def frigate_reset_probability_cache():
+    # Wipes the incremental per-day hit cache, forcing the next
+    # frigate_refresh_probability run to do a full rescan and reseed
+    # from scratch. Call this after changing zones/min_score/labels/
+    # required_zones on a probability entry — the incremental design
+    # otherwise just keeps folding new events into data gathered under
+    # the OLD filter settings, silently mixing old and new criteria.
+    state.set(DAILY_CACHE_ENTITY, "ok", new_attributes={})
