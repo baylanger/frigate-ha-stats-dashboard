@@ -1,0 +1,44 @@
+type: custom:apexcharts-card
+header:
+  title: Street Passerby Probability — Saturday vs Sunday (last 3 weeks)
+graph_span: 24h
+span:
+  start: day
+apex_config:
+  chart:
+    type: bar
+    stacked: false
+  legend:
+    show: true
+    showForSingleSeries: true
+  xaxis:
+    type: datetime
+    labels:
+      format: "HH:mm"
+series:
+  - entity: sensor.passerby_probability
+    name: Saturday
+    type: column
+    color: "#1E88E5"
+    show:
+      legend_value: false
+    data_generator: |
+      const now = new Date();
+      const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+      return entity.attributes.labels.map((l, i) => {
+        const [hh, mm] = l.split(":").map(Number);
+        return [startOfDay + (hh * 60 + mm) * 60000, entity.attributes.person_saturday[i] * 100];
+      });
+  - entity: sensor.passerby_probability
+    name: Sunday
+    type: column
+    color: "#8E24AA"
+    show:
+      legend_value: false
+    data_generator: |
+      const now = new Date();
+      const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+      return entity.attributes.labels.map((l, i) => {
+        const [hh, mm] = l.split(":").map(Number);
+        return [startOfDay + (hh * 60 + mm) * 60000, entity.attributes.person_sunday[i] * 100];
+      });

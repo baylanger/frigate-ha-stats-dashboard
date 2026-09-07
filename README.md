@@ -5,7 +5,7 @@ event history:
 
 1. **Hourly detections** — bus/car/motorcycle/person counts per hour, last 12h
 2. **Passerby probability** — likelihood of a detection per 5-min bucket,
-   split weekday vs. weekend, based on the last 3 weeks
+   split weekday vs. Saturday vs. Sunday, based on the last 3 weeks
 
 Both are computed by a single pyscript file and rendered with the
 ApexCharts Card.
@@ -92,7 +92,7 @@ nothing below will work without it.
      5-min buckets had a detection, per day, per label. Each run only
      fetches events *since the last run* (cheap), folds them into
      today's entry, drops any day older than `days_back` from the
-     cache, and recomputes weekday/weekend probabilities from the
+     cache, and recomputes weekday/Saturday/Sunday probabilities from the
      retained per-day data — no Frigate query needed for that last
      step. This is what makes hourly (or even more frequent)
      `PROBABILITY_CRON` reasonable despite `days_back: 21` — the
@@ -164,8 +164,8 @@ nothing below will work without it.
   criteria together.
 - Click either sensor and check its **attributes** — you should see
   `hours`/`timestamps`/`person`/`car` arrays (hourly sensor) or
-  `labels`/`timestamps`/`person_weekday`/`person_weekend` arrays
-  (probability sensor). The `hours`/`labels` strings are just for
+  `labels`/`timestamps`/`person_weekday`/`person_saturday`/`person_sunday`
+  arrays (probability sensor). The `hours`/`labels` strings are just for
   readability here — the dashboard cards actually plot against
   `timestamps` (real millisecond values), since this apexcharts-card
   version needs an actual datetime axis to render bars correctly.
@@ -254,9 +254,9 @@ throws `series_in_graph[i.seriesIndex].entity is undefined` when
 `chart.type: heatmap` is used, because its internal hover/hookup logic
 assumes a line/bar/area "graph" structure that heatmap doesn't
 provide. Not fixable from the card config; it's a limitation of this
-card version. Two separate bar cards below is the reliable fallback —
+card version. Separate bar cards below is the reliable fallback —
 same pattern as the hourly detections card, just split so the 288
-weekday/weekend buckets aren't overlapping in one chart.
+buckets per day-group aren't overlapping in one chart.
 
 **Note:** these cards compute today's date **in the browser** (via
 `new Date()`) rather than relying on the sensor's stored `timestamps`
@@ -269,7 +269,7 @@ the date client-side avoids that staleness window entirely; the
 sensor's `labels` (`"HH:MM"` strings, not tied to any specific date)
 are what actually drive the bars.
 
-**Weekday:**
+**Weekday (Mon–Fri combined):**
 
 ```yaml
 type: custom:apexcharts-card
@@ -302,18 +302,20 @@ series:
       });
 ```
 
-**Weekend:**
+**Saturday vs. Sunday** (kept separate rather than combined into one
+"weekend" bucket, since traffic patterns on the two days can differ):
 
 ```yaml
 type: custom:apexcharts-card
 header:
-  title: Street Passerby Probability — Weekend (last 3 weeks)
+  title: Street Passerby Probability — Saturday vs Sunday (last 3 weeks)
 graph_span: 24h
 span:
   start: day
 apex_config:
   chart:
     type: bar
+    stacked: false
   legend:
     show: true
     showForSingleSeries: true
@@ -323,21 +325,36 @@ apex_config:
       format: "HH:mm"
 series:
   - entity: sensor.passerby_probability
-    name: Weekend
+    name: Saturday
     type: column
-    color: "#8E24AA"
+    color: "#1E88E5"
+    show:
+      legend_value: false
     data_generator: |
       const now = new Date();
       const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
       return entity.attributes.labels.map((l, i) => {
         const [hh, mm] = l.split(":").map(Number);
-        return [startOfDay + (hh * 60 + mm) * 60000, entity.attributes.person_weekend[i] * 100];
+        return [startOfDay + (hh * 60 + mm) * 60000, entity.attributes.person_saturday[i] * 100];
+      });
+  - entity: sensor.passerby_probability
+    name: Sunday
+    type: column
+    color: "#8E24AA"
+    show:
+      legend_value: false
+    data_generator: |
+      const now = new Date();
+      const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+      return entity.attributes.labels.map((l, i) => {
+        const [hh, mm] = l.split(":").map(Number);
+        return [startOfDay + (hh * 60 + mm) * 60000, entity.attributes.person_sunday[i] * 100];
       });
 ```
 
 If you add a `car` probability entry to `GRAPH_CONFIGS`, duplicate
-either card and swap `person_weekday`/`person_weekend` for
-`car_weekday`/`car_weekend`.
+either card and swap `person_weekday`/`person_saturday`/`person_sunday`
+for `car_weekday`/`car_saturday`/`car_sunday`.
 
 ---
 
@@ -356,13 +373,13 @@ ApexCharts card pointing at the new sensor's attributes.
 |---|---|
 | Sensor state exists but attributes are empty arrays | `zones`/`required_zones` too strict, wrong zone name, or `min_score` too high |
 | Sensor never appears | pyscript not reloaded, or a Python error — check Settings → System → Logs, filter "pyscript" |
-| Probability graph looks noisy/spiky | Expected with ~3 weekend/9 weekday samples per bucket at `bucket_min: 5`; widen `bucket_min` to 10–15 or wait for more days of data |
+| Probability graph looks noisy/spiky | Expected with small sample sizes per bucket at `bucket_min: 5` — especially Saturday/Sunday, which now sample from roughly 1/7th of days each instead of 2/7ths combined as "weekend" used to; widen `bucket_min` to 10–15 or wait for more days of data |
 | Hourly graph has too many/too few bars | Number of bars = `(hours_back * 60) / bucket_min`. e.g. 12h at `bucket_min: 15` = 48 bars — fine for ApexCharts, but if you push it much denser than that, either shorten `hours_back` or widen `bucket_min` to keep the chart readable |
 | Chart shows nothing in the dashboard, or the x-axis shows raw epoch numbers | This version of apexcharts-card doesn't reliably honor `xaxis: { type: category }` with string labels — it still builds a `datetime` axis internally, which can't parse strings and falls back to showing raw timestamps with no bars. Fix: use `xaxis: { type: datetime }` and feed real millisecond timestamps as the x value — both sensors expose a `timestamps` attribute for exactly this (both card YAMLs already use it) |
 | `Configuration error ... value.series[0].data is extraneous` | This apexcharts-card version has no plain `data:` key in its series schema — only `entity` + either recorder history or `data_generator` are valid. Use `data_generator` even for static/test data |
 | `NotImplementedError: ... not implemented ast ast_generatorexp` | pyscript's AST interpreter doesn't support Python generator expressions passed directly into a function call (e.g. `sum(x for x in ...)`). The current script avoids this — if you hit it, you're on an older copy, or added custom code using that pattern; wrap it in a list comprehension instead (`sum([x for x in ...])`) |
 | Probability card renders but shows no/partial bars, especially "missing" the busiest times of day | Without `graph_span`/`span: { start: day }`, apexcharts-card defaults to a *sliding* 24h window ending at the current real-world moment — but the sensor's `timestamps` are anchored to today's midnight-through-23:55 regardless of what time it actually is. Both probability card YAMLs already set `graph_span: 24h` + `span: { start: day }` to anchor the axis to the start of the calendar day instead — confirm both are present if this happens |
-| `series_in_graph[i.seriesIndex].entity` undefined / infinite loading spinner | This apexcharts-card build doesn't properly support `chart.type: heatmap` — its internal graph-index bookkeeping assumes line/bar/area. Avoid heatmap; use the two separate weekday/weekend bar cards instead (already the default in this README) |
+| `series_in_graph[i.seriesIndex].entity` undefined / infinite loading spinner | This apexcharts-card build doesn't properly support `chart.type: heatmap` — its internal graph-index bookkeeping assumes line/bar/area. Avoid heatmap; use the separate weekday/Saturday-Sunday bar cards instead (already the default in this README) |
 | Probability cards worked yesterday, show nothing today (no error) | The sensor's `timestamps` attribute was anchored to "today" as of its last nightly refresh (03:00) — after midnight, that's now "yesterday" until the cron catches up, and the card's `span: { start: day }` always means the browser's actual today. Current card YAML avoids this by computing bucket timestamps client-side from the sensor's `labels` instead of using `timestamps` for these two cards — confirm you're on that version if this happens |
 | Frigate API unreachable from pyscript | Check `FRIGATE_URL`, and that HA's pyscript sandbox has network/`requests` access enabled |
 | Log warning about blocking calls in the event loop | Shouldn't occur — the script already wraps `requests.get` in `task.executor()` to keep it off pyscript's async loop. If you see one anyway, check you copied the current version of `frigate-detections-stats.py` (the `_get` / `task.executor` helper) |
@@ -370,6 +387,6 @@ ApexCharts card pointing at the new sensor's attributes.
 | `RuntimeError: Cannot be called from within the event loop` | Caused by calling `hass.states.set(...)` directly instead of pyscript's `state.set(...)`. The current script already uses `state.set(...)` — if you hit this, you're on an older copy |
 | Every count is 0 even though Frigate shows events in that window | Some Frigate versions leave the top-level `score`/`top_score` fields `null` and put the real values under `data.score` / `data.top_score`. The current script checks both locations — if you're still seeing all zeros, pull a raw event via `curl .../api/events` and confirm where the score actually lives in your version |
 | `NameError: invalid name sensor.x (should be 'pyscript.entity')` | `state.persist()` only works on `pyscript.*` domain entities — it can't persist `sensor.*` (or any other domain) directly, full stop. The current script works around this by mirroring each sensor into a `pyscript.*` cache entity and restoring from that cache on `startup` — if you hit this error, you're on an older copy that tried to persist the sensor entities directly |
-| Weekend probability graph only ever shows 0% or 100%, weekday looks smoother | This is expected with a small sample — probability is `hit_days / n_days_sampled`. If `person_weekend_days_sampled` is currently `1` (check the sensor attribute in Developer Tools → States), every bucket can only be 0/1 or 1/1 — no in-between value is mathematically possible yet. Since Frigate retention was only recently extended, historical weekend days cant be backfilled; they accumulate one real calendar day at a time. Weekdays smooth out first simply because there are 5 of them per week vs. 2 weekend days. This self-corrects as more weekends pass within the 21-day window — no fix needed, just time |
+| Saturday or Sunday probability only ever shows 0%/50%/100% (few discrete steps), weekday looks smoother | Expected with a small sample — probability is `hit_days / n_days_sampled`. Check `person_saturday_days_sampled` / `person_sunday_days_sampled` in Developer Tools → States: with `n` days sampled, only multiples of `1/n` are possible (e.g. `n=2` → only 0%/50%/100%). Saturday and Sunday now sample separately (previously combined as "weekend"), so each has roughly half as many days as the old combined bucket did — expect coarser steps than before until more weeks accumulate. Weekdays smooth out faster simply because there are 5 of them per week vs. 1 each for Saturday/Sunday. Self-corrects with time — no fix needed |
 | Card was working, now stuck "loading..." after renaming a label in `GRAPH_CONFIGS` | Attribute keys on the sensor come directly from whatever strings are in that entry's `labels` list — renaming a label (e.g. `motorbike` → `motorcycle`) changes the attribute name too. Any card `data_generator` still referencing the old name gets `undefined`, which throws and hangs the card. Update every card that references that label whenever you rename one in `GRAPH_CONFIGS` |
 | Probability numbers look wrong/frozen after editing `zones`, `min_score`, `labels`, or `required_zones` in a probability entry | The incremental cache doesn't know a filter changed — it just keeps folding new events into whatever was already cached under the old filter, silently mixing old and new criteria. Run `pyscript.frigate_reset_probability_cache` (Developer Tools → Actions) after changing any filter on a `probability`-mode entry, then trigger `pyscript.frigate_refresh_probability` to force a full reseed |

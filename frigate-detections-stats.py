@@ -6,7 +6,7 @@ FRIGATE_URL = "http://<frigate-host>:5000"
 # --- Refresh schedules ---------------------------------------------------
 # Standard 5-field cron syntax: minute hour day month day_of_week
 HOURLY_CRON = "*/5 * * * *"        # how often the hourly/short-window graphs refresh
-PROBABILITY_CRON = "0 * * * *"     # how often the weekday/weekend probability graph refreshes (hourly — still a 21-day query each run, so more frequent than this gets expensive fast)
+PROBABILITY_CRON = "0 * * * *"     # how often the weekday/Saturday/Sunday probability graph refreshes (hourly — still a 21-day query each run, so more frequent than this gets expensive fast)
 
 # --- Survive HA restarts without re-querying Frigate immediately -------
 # state.persist() ONLY works on entities in the pyscript.* domain — it
@@ -155,7 +155,7 @@ def compute_hourly(cfg):
 #   1. Fetch only events since the last processed timestamp (cheap).
 #   2. Fold new hits into today's entry in the per-day cache.
 #   3. Drop any day older than days_back from the cache (rolling window).
-#   4. Recompute weekday/weekend probabilities from the *retained*
+#   4. Recompute weekday/Saturday/Sunday probabilities from the *retained*
 #      per-day cache — pure local math, no Frigate query involved.
 #   5. Persist the updated per-day cache + a "last processed" watermark.
 # If there's no cache yet, or the watermark is older than the days_back
@@ -223,7 +223,8 @@ def compute_probability(cfg):
                       if datetime.strptime(d, "%Y-%m-%d").date() >= cutoff_date}
 
         weekday_dates = [d for d in label_hits if datetime.strptime(d, "%Y-%m-%d").weekday() < 5]
-        weekend_dates = [d for d in label_hits if datetime.strptime(d, "%Y-%m-%d").weekday() >= 5]
+        saturday_dates = [d for d in label_hits if datetime.strptime(d, "%Y-%m-%d").weekday() == 5]
+        sunday_dates = [d for d in label_hits if datetime.strptime(d, "%Y-%m-%d").weekday() == 6]
 
         def probs(dates):
             n_days = max(len(dates), 1)
@@ -231,9 +232,11 @@ def compute_probability(cfg):
                     for b in range(n_buckets)]
 
         attrs[f"{label}_weekday"] = probs(weekday_dates)
-        attrs[f"{label}_weekend"] = probs(weekend_dates)
+        attrs[f"{label}_saturday"] = probs(saturday_dates)
+        attrs[f"{label}_sunday"] = probs(sunday_dates)
         attrs[f"{label}_weekday_days_sampled"] = len(weekday_dates)
-        attrs[f"{label}_weekend_days_sampled"] = len(weekend_dates)
+        attrs[f"{label}_saturday_days_sampled"] = len(saturday_dates)
+        attrs[f"{label}_sunday_days_sampled"] = len(sunday_dates)
 
         # Store back as sorted lists — sets aren't JSON-safe for state storage.
         sensor_daily_hits[label] = {d: sorted(b) for d, b in label_hits.items()}
