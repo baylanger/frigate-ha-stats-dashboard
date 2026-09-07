@@ -1,0 +1,48 @@
+type: custom:apexcharts-card
+header:
+  title: Detections — Last 12 Hours
+graph_span: 12h
+apex_config:
+  chart:
+    type: bar
+    stacked: true
+  legend:
+    show: true
+    showForSingleSeries: true
+  xaxis:
+    type: datetime
+    labels:
+      format: "HH:mm"
+series:
+  - entity: sensor.frigate_hourly_detections
+    name: Person
+    type: column
+    color: "#1E88E5"
+    show:
+      legend_value: false
+    data_generator: |
+      return entity.attributes.timestamps.map((t, i) => [t, entity.attributes.person[i]]);
+  - entity: sensor.frigate_hourly_detections
+    name: Car
+    type: column
+    color: "#E53935"
+    show:
+      legend_value: false
+    data_generator: |
+      return entity.attributes.timestamps.map((t, i) => [t, entity.attributes.car[i]]);
+  - entity: sensor.frigate_hourly_detections
+    name: Bicycle
+    type: column
+    color: "#43A047"
+    show:
+      legend_value: false
+    data_generator: |
+      return entity.attributes.timestamps.map((t, i) => [t, entity.attributes.bicycle[i]]);
+  - entity: sensor.frigate_hourly_detections
+    name: Motorcycle
+    type: column
+    color: "#FB8C00"
+    show:
+      legend_value: false
+    data_generator: |
+      return entity.attributes.timestamps.map((t, i) => [t, entity.attributes.motorcycle[i]]);
